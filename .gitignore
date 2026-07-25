@@ -1,0 +1,38 @@
+# ── Reconstructed by tools/build.sh (do NOT commit) ────────────────────────
+# Upstream clones (public repos; build.sh clones them at pinned commits,
+# patches Megatron's DSA dispatcher, and applies overlays/).
+/miles/
+/Megatron-LM/
+/src/
+# Python venv + downloaded prebuilt kernel wheels.
+/.venv/
+/wheels/
+# Build bookkeeping.
+/.build-stamps/
+/build-logs/
+
+# ── Large / generated data & artifacts (do NOT commit) ─────────────────────
+# Pruned/checkpoint model weights (hundreds of GB); rebuild with tools/build_Nlayer.py.
+/models/
+# SFT parquet; regenerate with tools/make_128k_sft_data.py.
+/data/
+# Run outputs, checkpoints, SLURM logs.
+/out/
+/logs/
+
+# ── Local / personal (do NOT commit) ───────────────────────────────────────
+/.claude/
+# Secrets — never commit. W&B key comes from the inherited env at runtime.
+*.env
+.env
+*secret*
+*apikey*
+*api_key*
+
+# ── Junk ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+core
+*.core
+core.*
+.DS_Store
