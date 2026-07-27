@@ -35,6 +35,32 @@ Offload trades recompute's *discard* for *keep-then-stream-to-host*, so PyTorch'
 
 **Confirmed public-stack ceiling @128k LoRA: 20 layers (recompute) / ~30 layers is one code change (chunked CE) away.**
 
+### 30L on 4 nodes (32 B200), grid TP8/PP1/EP32/ETP1, full recompute
+| Metric | 2-node (EP16) | **4-node (EP32)** |
+|--------|---------------|-------------------|
+| Params/rank (base) | 18.06 B (~36 GB) | **9.84 B (~19.7 GB)** ✅ halved again |
+| PyTorch allocated at failure | 159.6 GB | **143.75 GB** (↓16 GB, base savings realized) |
+| Failing allocation | 21.56 GiB | **43.12 GiB** (↑ — a large contiguous logits/activation tensor) |
+| Free at failure | 13.9 GB | 29.69 GB |
+| Est. total peak demand | ~190 GB | **~192 GB** |
+| Result | ❌ OOM | ❌ OOM |
+
+**Prediction was WRONG** (I expected fit). Base sharding worked exactly as modeled (36→19.7 GB/rank, ~16 GB freed), BUT the failing single allocation *grew* from 21.56→43.12 GiB, so total peak demand stayed ~flat (~190→~192 GB) and it still OOM'd by ~14 GB. The dominant term is a large un-shardable **logits/activation** tensor (likely a full 131072-token fp32 loss buffer surfaced by dynamic batching with more DP ranks) — it does NOT shrink with EP/nodes and here effectively offset the base savings.
+
+**Reinforced conclusion: adding nodes shrinks base but not the activation/logits peak — so more hardware alone cannot fit 30L/128k on the public bf16 stack.** The decisive lever remains chunked cross-entropy in `loss.py` (never materialize `[S×vocab]`), or shorter context.
+
+### 30L offload: 2-node vs 4-node — MORE NODES MADE IT WORSE
+| Config (offload, recompute off) | Base/rank | PyTorch allocated | Failing alloc | Free | Overshoot | Result |
+|---------------------------------|-----------|-------------------|---------------|------|-----------|--------|
+| 2-node EP16 (DP=2) | ~36 GB | 171.9 GB | 2.23 GiB | 2.00 GB | **~0.23 GB** | ❌ OOM (barely) |
+| **4-node EP32 (DP=4)** | ~19.7 GB | 167.9 GB | **10.33 GiB** | 6.10 GB | **~4.23 GB** | ❌ OOM (worse) |
+
+**Prediction was WRONG again.** Base sharding worked (params/rank 18→9.84 B), and allocated memory did drop (171.9→167.9 GB, ~4 GB), BUT the **failing single allocation grew 2.23→10.33 GiB** — so the overshoot got *bigger* (0.23→4.23 GB). Same trend in the recompute runs (2-node fail 21.56 GiB → 4-node fail 43.12 GiB).
+
+**The real pattern: the dominant per-rank activation/logits allocation SCALES UP with the data-parallel degree (DP=2→4), swamping the base savings from more expert sharding.** (Likely the MoE all-to-all dispatch buffers and/or dynamic-batch token packing growing with DP.) So adding nodes is *counterproductive* here — **the closest anyone got to fitting 30L/128k was the 2-node offload run (~0.23 GB short).**
+
+**Final public-stack verdict: 30L/128k does NOT fit at any node count (1/2/4) with bf16 base. Best is 2-node + offload, ~0.23 GB short. Only a code change (chunked CE) or shorter context closes it. Confirmed ceiling stays 20 layers (recompute).**
+
 ## Breaking point (8 GPU, bf16 base, 128k, LoRA)
 - **Max that fits: ~20 layers (barely, ~182/183 GB). 30 layers OOMs. Boundary = 20–30, close to 20.**
 - Peak ≈ base_weight/rank (grows w/ MoE layers) + ~130–140 GB of ~constant 128k activation/DSA working memory.
