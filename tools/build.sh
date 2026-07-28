@@ -119,6 +119,14 @@ open(p,"w").write(s.replace(old,new,1)); print("patched dsa CP opt-in")
 PYEOF
   fi
   gitclone https://github.com/radixark/Megatron-Bridge.git "$S/Megatron-Bridge" -b bridge --depth 1
+  # OVERLAY: chunked DSA indexer (avoids the O(S^2) dense [S x S_kv] logits that OOMs
+  # at 128k -- see CP_INVESTIGATION.md). Applied to the source BEFORE install so the
+  # copied-into-.venv package carries the fix. Whole-file overlay from overlays/.
+  _bidx="$S/Megatron-Bridge/src/megatron/bridge/models/glm5/tilelang/indexer.py"
+  if [ -f "$ROOT/overlays/megatron-bridge/glm5-tilelang-indexer.py" ] && [ -f "$_bidx" ]; then
+    cp "$ROOT/overlays/megatron-bridge/glm5-tilelang-indexer.py" "$_bidx"
+    echo "  overlay -> bridge glm5 tilelang indexer (chunked)"
+  fi
   (cd "$S/Megatron-Bridge" && $PIP --no-deps --no-build-isolation .)
   gitclone https://github.com/fzyzcjy/torch_memory_saver.git "$S/torch_memory_saver"
   (cd "$S/torch_memory_saver" && git checkout -q d64a639 && $PIP --no-cache-dir --no-deps .)
