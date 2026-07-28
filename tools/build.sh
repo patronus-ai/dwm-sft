@@ -103,6 +103,21 @@ assert old in s, "dispatcher block not found (upstream changed?)"
 open(p,"w").write(s.replace(old,new,1)); print("patched dsa dispatch")
 PYEOF
   fi
+  # PATCH: scope the DSA context-parallel guard to an opt-in (DSA_ALLOW_CP=1). Default
+  # behavior (assert CP==1) is unchanged. See CP_INVESTIGATION.md — CP runs for GLM but
+  # 128k still OOMs on the indexer's O(S^2) dense score matrix; this opt-in enables the
+  # CP experiments without weakening the default for other DSA users.
+  _cfg="$ROOT/Megatron-LM/megatron/core/transformer/transformer_config.py"
+  if [ -f "$_cfg" ] && ! grep -q 'DSA_ALLOW_CP' "$_cfg"; then
+    python3 - "$_cfg" <<'PYEOF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+old='        elif self.experimental_attention_variant == "dsa":\n            assert (\n                self.context_parallel_size == 1\n            ), "Currently context parallelism is not supported by DSAttention!"'
+new='        elif self.experimental_attention_variant == "dsa":\n            import os as _os\n            assert (\n                self.context_parallel_size == 1 or _os.environ.get("DSA_ALLOW_CP") == "1"\n            ), "Currently context parallelism is not supported by DSAttention! (set DSA_ALLOW_CP=1 to opt into GLM\'s CP-aware plugin path)"'
+assert old in s, "DSA CP assert block not found (upstream changed?)"
+open(p,"w").write(s.replace(old,new,1)); print("patched dsa CP opt-in")
+PYEOF
+  fi
   gitclone https://github.com/radixark/Megatron-Bridge.git "$S/Megatron-Bridge" -b bridge --depth 1
   (cd "$S/Megatron-Bridge" && $PIP --no-deps --no-build-isolation .)
   gitclone https://github.com/fzyzcjy/torch_memory_saver.git "$S/torch_memory_saver"

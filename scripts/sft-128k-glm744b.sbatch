@@ -28,11 +28,12 @@ export TMPDIR=/tmp no_proxy="127.0.0.1,localhost"
 
 NNODES=${SLURM_NNODES:-4}; GPN=${GPUS_PER_NODE:-8}; WORLD=$((NNODES*GPN))
 # --- parallelism grid (STARTING POINT — tune) : TP*CP*PP*DP must == WORLD(32) ---
-# DSAttention does NOT support context parallelism -> CP=1. So the 128k sequence
+# CP overridable via env. The DSA *SFT* path DOES have CP plumbing (slice_with_cp,
+# CP-aware logits); only --use-rollout-indexer-replay asserts CP==1. So the 128k sequence
 # is NOT split along the seq dim; instead PP splits the 78 layers (activation
 # memory per rank ∝ layers/PP), TP+sequence-parallel split hidden/activations,
 # DSA sparsity (top-2048) keeps attention cheap, and full recompute is on.
-TP=${TP:-8}; CP=1; PP=${PP:-1}; EP=${EP:-4}; ETP=${ETP:-$TP}
+TP=${TP:-8}; CP=${CP:-1}; PP=${PP:-1}; EP=${EP:-4}; ETP=${ETP:-$TP}
 # TP8 * CP1 * PP1 * DP4 = 32.  PP=1 is REQUIRED by miles LoRA (weight-sync/adapter
 # path asserts PP==1). PP=1 kept all 78 layers -> OOM at 128k when the base was
 # dequantized to bf16 (~1.5 TB). FIX: --fp8-param-gather keeps the frozen base in
@@ -108,7 +109,7 @@ WANDB_ARGS=(--use-wandb --wandb-project "${WANDB_PROJECT:-glm744b-128k-zheli}"
 }
 build_args
 
-TENV='["INDEXER_ROPE_NEOX_STYLE","NVSHMEM_DISABLE_NCCL","GLOO_SOCKET_IFNAME","NCCL_SOCKET_IFNAME","NCCL_IB_DISABLE","NCCL_IB_HCA","NCCL_NVLS_ENABLE","NCCL_CROSS_NIC","NCCL_NET_GDR_LEVEL","NCCL_DEBUG","PYTORCH_CUDA_ALLOC_CONF"]'
+TENV='["INDEXER_ROPE_NEOX_STYLE","NVSHMEM_DISABLE_NCCL","GLOO_SOCKET_IFNAME","NCCL_SOCKET_IFNAME","NCCL_IB_DISABLE","NCCL_IB_HCA","NCCL_NVLS_ENABLE","NCCL_CROSS_NIC","NCCL_NET_GDR_LEVEL","NCCL_DEBUG","PYTORCH_CUDA_ALLOC_CONF","DSA_ALLOW_CP"]'
 TRAIN_ENV_JSON=$(TENV="$TENV" python3 -c 'import os,json;print(json.dumps({k:os.environ[k] for k in json.loads(os.environ["TENV"]) if k in os.environ}))')
 
 TRAIN_CMD=(python3 -u train_async.py --actor-num-nodes $NNODES --actor-num-gpus-per-node $GPN
