@@ -1,0 +1,81 @@
+================================================================================
+ Interactive 2-node CP=2 run  --  NODE-2 (Ray WORKER)
+ GLM-5.2 30-layer LoRA-SFT, CP=2, DSA chunked indexer. Run top-to-bottom on node-2.
+ Companion file for node-1: docs/interactive-cp2-node1-head.txt
+================================================================================
+
+This node only joins the Ray cluster. Training is launched from node-1 (the head).
+
+ORDER OF OPERATIONS ACROSS THE TWO NODES:
+  node-1: (A) env  -> (B) start head  [prints HEAD_IP]
+  node-2: (A) env  -> (C) join head   [needs HEAD_IP from node-1]   <== THIS FILE
+  node-1: (D) launch training
+  both  : (E) cleanup when done
+
+  Do node-1 step (B) FIRST -- you need its HEAD_IP for step (C) below.
+
+
+--------------------------------------------------------------------------------
+(A) ENV  -- must be exported BEFORE `ray start` so the Ray actors inherit it.
+    Identical to node-1's step (A).
+--------------------------------------------------------------------------------
+
+cd /workspace/users/zhe-li/repos/glm-sft/miles
+source /workspace/users/zhe-li/repos/glm-sft/env.sh          # venv, PYTHONPATH, MEGATRON_PATH, LD_LIBRARY_PATH
+
+# fabric NICs / RoCE (ported from the validated cluster setup)
+export NET_IFACE=ens1
+export GLOO_SOCKET_IFNAME=ens1 NCCL_SOCKET_IFNAME=ens1
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_9,mlx5_12,mlx5_13
+export NCCL_NVLS_ENABLE=0 NCCL_CROSS_NIC=0 NCCL_NET_GDR_LEVEL=0 NCCL_DEBUG=WARN
+export INDEXER_ROPE_NEOX_STYLE=0 NVSHMEM_DISABLE_NCCL=1
+
+# the CP fixes
+export DSA_ALLOW_CP=1               # scoped opt-in past the DSA CP assert
+export DSA_INDEXER_Q_CHUNK=4096     # chunked indexer (avoids the O(S^2) dense logits)
+
+# per-node RoCE-v2 GID index (auto-detect; falls back to 7)
+_detect_gid() { local h=$(echo "$NCCL_IB_HCA" | cut -d, -f1); local g=/sys/class/infiniband/$h/ports/1/gid_attrs/types
+  [ -d "$g" ] && for i in $(seq 0 31); do grep -qi "RoCE v2" "$g/$i" 2>/dev/null && { echo "$i"; return; }; done; echo 7; }
+export NCCL_IB_GID_INDEX=$(_detect_gid)
+
+export RAY_PORT=20001
+
+
+--------------------------------------------------------------------------------
+(C) JOIN THE HEAD  (paste node-1's HEAD_IP printed in its step (B))
+--------------------------------------------------------------------------------
+
+export HEAD_IP=<paste node-1's IP here>      # e.g. 10.65.0.3
+
+rm -rf /tmp/ray_zheli_interactive
+ray start --address="$HEAD_IP:$RAY_PORT" \
+  --num-gpus 8 --num-cpus 64 --temp-dir /tmp/ray_zheli_interactive
+
+# sanity: this node contributes 8 GPUs; total across the cluster should be 16.
+ray status        # -> should show 16.0 GPU
+
+# >>> node-2 is done. Go back to node-1 and run its step (D) to launch training. <<<
+
+
+--------------------------------------------------------------------------------
+(E) CLEANUP  (run on node-2 when done; node-1 does the same in its file)
+--------------------------------------------------------------------------------
+
+ray stop
+rm -rf /tmp/ray_zheli_interactive
+# if a stale ray lingers:  pkill -9 -f ray_zheli_interactive
+
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+- ENV BEFORE RAY: the DSA_ALLOW_CP / DSA_INDEXER_Q_CHUNK / NCCL vars / GID index
+  must be exported here (step A) BEFORE `ray start`, so this node's actors inherit
+  them -- not just on node-1.
+- This node runs NO training command. It only hosts 8 of the 16 actors; node-1's
+  driver drives them. Keep this shell open while training runs.
+- Watch memory live:
+    watch -n2 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+================================================================================

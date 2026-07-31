@@ -1,0 +1,88 @@
+================================================================================
+ How to run GLM-5.2 LoRA-SFT at 128k context -- options & tradeoffs
+ (public stack: radixark/miles + Megatron-LM + Megatron-Bridge, 4x8 B200)
+ Summary of what it takes, and the menu of options given resources.
+================================================================================
+
+--------------------------------------------------------------------------------
+THE ONE THING THAT MAKES 128k HARD
+--------------------------------------------------------------------------------
+At 128k, memory is dominated by ACTIVATION, which scales with sequence length --
+and that term shards ONLY with context parallelism (CP). Everything else (base
+weights, experts) shards with EP / nodes. So 128k decomposes into two independent
+memory terms:
+
+  TERM                         SIZE                    SHARDED BY   STATUS
+  ---------------------------  ----------------------  -----------  -----------------
+  Activation (proportional     ~130-140 GB/rank        CP only      DONE: CP enabled
+    to the 128k sequence)        (full seq)                          (DSA_ALLOW_CP=1)
+  DSA indexer O(S^2)           was 206 GiB at 128k     (was un-      DONE: chunked
+                                                        shardable)    top-k fix
+  Base weights (bf16)          ~2 bytes/param, /EP     EP / nodes   needs enough
+                                                                      GPUs for EP16
+
+=> The 128k CAPABILITY itself is now solved: CP shards the activation, and the
+   chunked indexer removed the O(S^2) wall. What's left is purely a
+   MODEL-SIZE  <->  NODE-COUNT tradeoff, because of the base weights.
+
+
+--------------------------------------------------------------------------------
+THE MENU -- pick a point
+--------------------------------------------------------------------------------
+
+OPTION A -- 128k RIGHT NOW, on 2 nodes  ->  up to ~20 layers (~172 B)
+  - Proven: 20L already ran at 128k on ONE node (895 tok/s, ~54k tokens/min).
+  - On 2 nodes with CP=2 it fits with ~50 GB headroom.
+  - The guaranteed 128k path with today's resources.
+  - Grid: TP8 / CP2 / EP8 (2 nodes) + chunked indexer.
+  - Script: scripts/cp-test-20L-128k-cp2.sbatch
+
+OPTION B -- 128k with ~270 B (30 layers)  ->  needs 4 nodes
+  - Why 2 nodes is not enough: with EP8 the base is ~69 GB/rank and the MoE
+    backward OOMs by ~8.6 GB. (Confirmed on 2 nodes, even with the indexer fix.)
+  - Fix: EP16 (halves base to ~36 GB) + CP=2 -> the TP8 / CP2 / DP2 / EP16 grid,
+    which requires 4 nodes (DP2 -> 32 GPUs).
+  - All code fixes are in place; blocked ONLY on a free 4-node window.
+  - Script: scripts/cp-test-30L-128k-cp2-4node.sbatch
+
+OPTION C -- 128k with a BIGGER model, or FEWER nodes  ->  shrink the base weights
+  - The base is the only term nodes/CP don't fully solve.
+  - Running the base in fp8/nvfp4 (~half or quarter the bytes) is how you push
+    128k toward 400 B+ or onto fewer nodes.
+  - This is what the PRIVATE patronus-ai/miles-nvfp4 fork does.
+  - On the public stack --fp8-param-gather exists but did NOT actually keep the
+    base in fp8 (tested: it still dequantized to bf16). So Option C = larger effort
+    / private fork.
+
+
+--------------------------------------------------------------------------------
+RECOMMENDATION
+--------------------------------------------------------------------------------
+- Want a 128k result TODAY:        Option A (20L/128k/CP2, 2 nodes). It WILL fit,
+                                   gives the first clean CP-at-128k run end-to-end
+                                   + a real 2-node/128k throughput number, and
+                                   validates the CP + chunked-indexer stack.
+- Specifically need ~270 B @128k:  Option B -- wait for a 4-node window, then the
+                                   EP16/CP2 run (already built).
+- Need bigger than ~270 B @128k:   Option C -- the fp8/nvfp4-base path (private
+                                   fork), a larger effort.
+
+
+--------------------------------------------------------------------------------
+STATUS OF THE ENABLING FIXES (all committed; see CP_INVESTIGATION.md)
+--------------------------------------------------------------------------------
+  [x] CP unblocked for GLM's DSA path        (scoped DSA_ALLOW_CP opt-in)
+  [x] DSA indexer O(S^2) OOM fixed           (chunked top-k, DSA_INDEXER_Q_CHUNK)
+  [x] reproducible via overlay + build.sh    (bridge indexer overlay)
+  [ ] 30L/128k end-to-end on 4 nodes         (needs a 4-node window)
+  [ ] CP numerical correctness verified      (pruned test models give NaN loss;
+                                              needs a real checkpoint to confirm)
+
+--------------------------------------------------------------------------------
+DEMONSTRATED 128k HIGH-WATER MARK SO FAR
+--------------------------------------------------------------------------------
+  20 layers (~172 B), 1 node, EP8, full recompute, bf16 base + LoRA r16:
+    - FITS at ~182/183 GB (edge)
+    - 895 tok/s  =  ~54k tokens/min  =  ~17.4 min/step (measured)
+  30 layers (~270 B) @128k: not yet landed (needs the 4-node EP16/CP2 run).
+================================================================================

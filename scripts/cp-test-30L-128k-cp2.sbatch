@@ -17,5 +17,7 @@ export SEQ_LEN=131072
 export PROMPT_DATA=/workspace/users/zhe-li/repos/glm-sft/data/sft_128k.parquet
 export TP=8 CP=2 PP=1 EP=8 ETP=1 NUM_EPOCH=1
 export DSA_ALLOW_CP=1
+export DSA_INDEXER_Q_CHUNK=4096   # chunked indexer -> no O(S^2) dense logits (was OOM by 0.22 GB pre-fix)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_PROJECT=glm-cptest WANDB_GROUP=cptest RUN=cptest-30L-128k-cp2
 exec bash /workspace/users/zhe-li/repos/glm-sft/scripts/sft-128k-glm744b.sbatch

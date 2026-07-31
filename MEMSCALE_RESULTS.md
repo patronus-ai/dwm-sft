@@ -69,3 +69,25 @@ Offload trades recompute's *discard* for *keep-then-stream-to-host*, so PyTorch'
 ## Scaling to 32 GPU (real deployment grid, EP×ETP=32 = 4× more expert sharding)
 - Base/rank shrinks ~4× → breaking point ≈ 4× more layers ≈ ~60-80 layers region.
 - Consistent with: full 78-layer 744B OOM'd on 32 GPU (bf16). So 32-GPU bf16 is ~at/over the edge for full 128k → need fp8/nvfp4 base (the patronus path) or fewer layers/context.
+
+## Context parallelism unlocks 128k (2026-07-31) — measured throughput
+After the two CP enablers (scoped `DSA_ALLOW_CP` + **chunked DSA indexer**, see
+`CP_INVESTIGATION.md`), 128k runs end-to-end with context parallelism.
+
+### Measured throughput (128k, LoRA r16, bf16 base, `perf/actor_train_tok_per_s`)
+| Model | Ctx | Nodes / grid | tok/s | tokens/min | step |
+|-------|-----|--------------|-------|-----------|------|
+| 20L (~172B) | 128k | 1 node, EP8 (no CP) | **895** | ~54k | ~17.4 min |
+| 30L (~270B) | 64k  | 2 nodes, CP2/EP8 | 2,470 | ~148k | ~3.2 min |
+| **20L (~172B)** | **128k** | **2 nodes, CP2/EP8 + chunked indexer** | **~3,000** | **~180k** | ~5.2 min |
+
+Note: the 1-node 20L/128k number (895 tok/s) supersedes the earlier "~17 min/step ⇒ 56k" estimate — it is the logged metric. The 20L/128k/CP2 2-node run (job 4597) completed rc=0, all steps ok=true, no OOM — the **first clean CP-at-128k run**. Throughput 895→3,000 tok/s (1→2 nodes) is super-linear because the 1-node run was memory-saturated at the 183 GB edge; CP=2 relieves that.
+
+### 30L (~270B) @ 128k with CP — still needs 4 nodes
+- 2 nodes, CP2/EP8 + chunked indexer (job 4596): got PAST the indexer and forward, then OOM in the **MoE backward** by ~8.6 GB (10.78 GiB needed, 2.16 free). Base ~69 GB/rank (EP8) is too big on 2 nodes.
+- Fix = EP16 (base → ~36 GB) which needs DP2 → **4 nodes** (`TP8/CP2/DP2/EP16`). Fixes all in place; blocked only on a 4-node window.
+
+### 128k feasibility summary (public bf16 stack, LoRA-SFT)
+- **Demonstrated:** ~172B (20L) @128k, 2 nodes, CP2 — ~180k tokens/min.
+- **Engineered/untested:** ~270B (30L) @128k, 4 nodes, CP2/DP2/EP16.
+- **Est. 20L @128k on 4 nodes (CP2/DP2/EP16):** ~280k–340k tokens/min (DP2 doubling; sublinear).

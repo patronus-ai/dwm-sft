@@ -1,0 +1,122 @@
+================================================================================
+ Interactive 2-node CP=2 run  --  NODE-1 (Ray HEAD + training driver)
+ GLM-5.2 30-layer LoRA-SFT, CP=2, DSA chunked indexer. Run top-to-bottom on node-1.
+ Companion file for node-2: docs/interactive-cp2-node2-worker.txt
+================================================================================
+
+Grid: TP8 x CP2 x DP1 x PP1 = 16 GPUs (2 nodes x 8).
+      EP*ETP = 8*1 = 8 = TP*DP  ;  EP=8 divides 256 experts.
+
+ORDER OF OPERATIONS ACROSS THE TWO NODES:
+  node-1: (A) env  -> (B) start head  [prints HEAD_IP]
+  node-2: (A) env  -> (C) join head   [needs HEAD_IP from node-1]
+  node-1: (D) launch training
+  both  : (E) cleanup when done
+
+
+--------------------------------------------------------------------------------
+(A) ENV  -- must be exported BEFORE `ray start` so the Ray actors inherit it
+--------------------------------------------------------------------------------
+
+cd /workspace/users/zhe-li/repos/glm-sft/miles
+source /workspace/users/zhe-li/repos/glm-sft/env.sh          # venv, PYTHONPATH, MEGATRON_PATH, LD_LIBRARY_PATH
+
+# fabric NICs / RoCE (ported from the validated cluster setup)
+export NET_IFACE=ens1
+export GLOO_SOCKET_IFNAME=ens1 NCCL_SOCKET_IFNAME=ens1
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_9,mlx5_12,mlx5_13
+export NCCL_NVLS_ENABLE=0 NCCL_CROSS_NIC=0 NCCL_NET_GDR_LEVEL=0 NCCL_DEBUG=WARN
+export INDEXER_ROPE_NEOX_STYLE=0 NVSHMEM_DISABLE_NCCL=1
+
+# the CP fixes
+export DSA_ALLOW_CP=1               # scoped opt-in past the DSA CP assert
+export DSA_INDEXER_Q_CHUNK=4096     # chunked indexer (avoids the O(S^2) dense logits)
+
+# per-node RoCE-v2 GID index (auto-detect; falls back to 7)
+_detect_gid() { local h=$(echo "$NCCL_IB_HCA" | cut -d, -f1); local g=/sys/class/infiniband/$h/ports/1/gid_attrs/types
+  [ -d "$g" ] && for i in $(seq 0 31); do grep -qi "RoCE v2" "$g/$i" 2>/dev/null && { echo "$i"; return; }; done; echo 7; }
+export NCCL_IB_GID_INDEX=$(_detect_gid)
+
+export RAY_PORT=20001
+
+
+--------------------------------------------------------------------------------
+(B) START THE RAY HEAD  (this is node-1)
+--------------------------------------------------------------------------------
+
+export HEAD_IP=$(ip -o -4 addr show ens1 | awk '{print $4}' | cut -d/ -f1)
+echo "HEAD_IP=$HEAD_IP   <<< copy this into node-2's file, step (C)"
+
+rm -rf /tmp/ray_zheli_interactive
+ray start --head --node-ip-address="$HEAD_IP" --port=$RAY_PORT \
+  --num-gpus 8 --num-cpus 64 --temp-dir /tmp/ray_zheli_interactive --disable-usage-stats
+# no --block -> ray daemonizes and returns the prompt.
+
+# >>> NOW go run node-2's file (steps A + C) before continuing. <<<
+# When node-2 has joined, confirm the cluster sees 16 GPUs:
+ray status        # -> should show 16.0 GPU
+
+
+--------------------------------------------------------------------------------
+(D) LAUNCH TRAINING  (node-1 only, after node-2 has joined)
+--------------------------------------------------------------------------------
+
+export RAY_ADDRESS="$HEAD_IP:$RAY_PORT"
+
+# ---- pick the run size -------------------------------------------------------
+# Validate the setup at 64k first (this fits). The 128k target on 2 nodes was ~0.22 GB
+# short at CP=2 (base ~69 GB, EP8) -- that is what EP16 on 4 nodes is for.
+export SEQ_LEN=65536   PROMPT_DATA=/workspace/users/zhe-li/repos/glm-sft/data/sft_64k.parquet
+# export SEQ_LEN=131072 PROMPT_DATA=/workspace/users/zhe-li/repos/glm-sft/data/sft_128k.parquet   # 128k target
+
+# ---- grid + model ------------------------------------------------------------
+export TP=8 CP=2 PP=1 EP=8 ETP=1
+source /workspace/users/zhe-li/repos/glm-sft/miles/scripts/models/glm5.2-744B-A40B_30layer.sh   # -> MODEL_ARGS[]
+MODEL=/workspace/users/zhe-li/repos/glm-sft/models/GLM-5.2_30layer
+OUT=/workspace/users/zhe-li/repos/glm-sft/out/cp2-interactive; mkdir -p "$OUT"
+
+python3 -u train_async.py \
+  --actor-num-nodes 2 --actor-num-gpus-per-node 8 \
+  "${MODEL_ARGS[@]}" \
+  --hf-checkpoint "$MODEL" --load "$MODEL" --save "$OUT/ckpt" --save-interval 1000000 \
+  --rollout-function-path miles.rollout.sft_rollout.generate_rollout \
+  --prompt-data "$PROMPT_DATA" --input-key messages --rollout-shuffle \
+  --num-epoch 1 --rollout-batch-size 8 --global-batch-size 8 \
+  --loss-type sft_loss --calculate-per-token-loss --disable-compute-advantages-and-returns --debug-train-only \
+  --lora-rank 16 --lora-alpha 32 --lora-dropout 0.0 \
+  --target-modules "gate_proj,up_proj,down_proj" --megatron-to-hf-mode bridge \
+  --tensor-model-parallel-size $TP --pipeline-model-parallel-size $PP --context-parallel-size $CP \
+  --expert-model-parallel-size $EP --expert-tensor-parallel-size $ETP \
+  --sequence-parallel --seq-length $SEQ_LEN --use-dynamic-batch-size --max-tokens-per-gpu $SEQ_LEN \
+  --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 \
+  --moe-token-dispatcher-type alltoall \
+  --optimizer adam --lr 1e-4 --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.95 \
+  --attention-dropout 0.0 --hidden-dropout 0.0 --accumulate-allreduce-grads-in-fp32 \
+  --attention-softmax-in-fp32 --attention-backend flash --allgather-cp \
+  --dsa-attention-backend tilelang --qkv-format thd
+
+# Optional W&B: add   --use-wandb --wandb-project glm-cptest --wandb-run-id cp2-interactive
+#   (WANDB_API_KEY comes from env.sh)
+
+
+--------------------------------------------------------------------------------
+(E) CLEANUP  (run on node-1 when done; node-2 does the same in its file)
+--------------------------------------------------------------------------------
+
+ray stop
+rm -rf /tmp/ray_zheli_interactive
+# if a stale ray lingers:  pkill -9 -f ray_zheli_interactive
+
+
+--------------------------------------------------------------------------------
+NOTES
+--------------------------------------------------------------------------------
+- ENV BEFORE RAY: no --train-env-vars interactively, so actors inherit whatever
+  you exported in step (A) before `ray start`. Both nodes must do step (A).
+- Watch memory live:
+    watch -n2 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+- Training runs from THIS node (the head). node-2 only runs env + join + cleanup.
+- Start at 64k, then switch to the 131072 line for the 128k attempt (right at the
+  edge on 2 nodes; the clean fit is EP16 on 4 nodes -- TP8/CP2/DP2/EP16).
+================================================================================

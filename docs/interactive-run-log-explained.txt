@@ -1,0 +1,107 @@
+================================================================================
+ What the interactive CP=2 startup log means -- plain-English walkthrough
+ (train_async.py driver on node-1 + 16 MegatronTrainRayActors across 2 nodes)
+ Companion to docs/interactive-cp2-run.txt
+================================================================================
+
+The startup log runs through 5 phases: reserve GPUs -> spawn a worker per GPU
+-> build+shard the model -> attach LoRA -> stream weights in (FP8->bf16).
+Then it hits the first training step. Below, each phase maps to the log lines.
+
+
+--------------------------------------------------------------------------------
+PHASE 1 -- the driver claims the GPUs   (placement_group.py)
+--------------------------------------------------------------------------------
+  Creating placement group with 16 GPUs...
+  bundle 0..7   node: 10.65.0.3   (node-1, the head)
+  bundle 8..15  node: 10.65.0.4   (node-2, the worker)
+
+train_async.py (the "driver" on node-1) asks Ray to RESERVE the 16 GPUs it
+needs. Ray returns a "placement group" of 16 bundles -- one GPU each -- pinning
+8 to node-1 and 8 to node-2. i.e. "give me one slot per GPU across both machines
+so I can put one training worker on each." The RAY_ADDRESS line just confirms it
+connected to the cluster you started by hand.
+
+
+--------------------------------------------------------------------------------
+PHASE 2 -- a training worker is spawned on every GPU
+--------------------------------------------------------------------------------
+The (pid=...) and (MegatronTrainRayActor pid=...) lines are Ray launching 16
+ACTORS -- one Python process per GPU (local pids on node-1; ip=10.65.0.4 ones on
+node-2). Each actor is a MegatronTrainRayActor = one rank of the distributed model.
+
+All the noisy warnings here are BENIGN import-time chatter, not errors:
+  - "deep_ep is not installed"                -> optional MoE all-to-all kernel; falls back.
+  - "transformers not tested with modelopt",
+    "torch_dtype deprecated",
+    "MimoModelConfig experimental",
+    "full scope deprecated"                    -> version-drift warnings.
+  - "[ERROR] cache_position ... Qwen3ASRThinker..." -> docstring lint from an UNRELATED
+                                                 model in the bridge's model zoo; harmless.
+  - "FlashInfer mxfp8_quantize not available;
+     falling back to Triton"                   -> uses the Triton kernel instead; fine.
+
+
+--------------------------------------------------------------------------------
+PHASE 3 -- each rank initializes itself   (fn=init phase=start)
+--------------------------------------------------------------------------------
+Per actor, in order:
+  - "Applying monkey patch to torch.distributed" -> miles swaps in a "reloadable"
+        process group (so it can rebuild comms for weight-sync later).
+  - "Set NUMA affinity for GPU N"                -> pin each process to the CPU/RAM
+        closest to its GPU (performance).
+  - "Enable megatron experimental"               -> turn on the experimental
+        attention path (needed for DSA).
+  - "building HuggingFaceTokenizer" + "setting random seeds to 1234" -> load
+        tokenizer, seed RNG for reproducibility.
+  - then it BUILDS the Megatron model shell (empty, sharded across the
+        TP8/CP2/EP8 grid).
+
+
+--------------------------------------------------------------------------------
+PHASE 4 -- LoRA is attached, base is counted
+--------------------------------------------------------------------------------
+  Created LoRA: rank=16, alpha=32, target_modules=['linear_fc1','linear_fc2']
+  [PEFT+Recompute] Patched TransformerBlock.forward to enable grad on hidden_states...
+  number of parameters on rank (0,0): 34490522880
+
+  - LoRA adapters are injected onto the MoE expert projections (linear_fc1 /
+    linear_fc2 = the Megatron names your gate_proj,up_proj,down_proj map to).
+    Only these adapters are trained; the base is frozen.
+  - The [PEFT+Recompute] patch is a KEY trick: with a frozen base and only LoRA
+    trainable, a normal activation-checkpoint (recompute) block would not trigger
+    a backward pass (its input needs no grad). The patch forces hidden_states to
+    require grad so recompute's backward still runs. This is what makes
+    recompute + frozen-base + PP=1 work.
+  - 34,490,522,880 = 34.5 B params on this rank = the base-weight shard
+    (EP8 -> ~69 GB in bf16). That is the frozen base each GPU holds.
+
+
+--------------------------------------------------------------------------------
+PHASE 5 -- weights load from disk   (the bridge)
+--------------------------------------------------------------------------------
+  Load checkpoint from HuggingFace model into Megatron (path=...GLM-5.2_30layer)
+  Dtype mismatch: HF weights are float8_e4m3fn but Megatron uses bfloat16. Casting...
+  NCCL version 2.28.9+cuda13.0
+
+  - The bridge reads the on-disk HF checkpoint and scatters each weight into this
+    rank's shard of the Megatron model (checkpoint.py:183 -> AutoBridge.load_hf_weights).
+  - "Dtype mismatch ... Casting to bfloat16" is the FP8 -> bf16 DEQUANT on load:
+    the stored checkpoint is FP8, but the public stack runs the base in bf16.
+    This is why the base is ~69 GB/rank (and why full 128k is tight).
+  - "NCCL version" = the GPU-to-GPU comm library initializing for collectives.
+
+
+--------------------------------------------------------------------------------
+WHAT COMES NEXT  (watch for these lines)
+--------------------------------------------------------------------------------
+  1. all ranks finish loading      -> "fn=init phase=end ok=true"
+  2. the SFT "rollout"             -> trivial under --debug-train-only (just formats data)
+  3. "step 0/1: {'train/loss': ...}" -> the FIRST training step:
+        * this is the fit/OOM moment (if memory bites on the CP=2 path, it shows here)
+        * and the throughput/loss readout.
+
+If you see phase=end ok=true then a step with a loss -> you are training.
+If it OOMs, it will be at the first forward; on 2 nodes CP=2 @ 128k was ~0.22 GB
+short (base ~69 GB, EP8) -- the clean fit is EP16 on 4 nodes (TP8/CP2/DP2/EP16).
+================================================================================
