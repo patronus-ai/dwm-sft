@@ -1,0 +1,76 @@
+================================================================================
+ fp8 FROZEN BASE for GLM-5.2 LoRA-SFT -- scope + Task-2 prototype result
+ Goal: run the FULL 744B @ 128k on 4 nodes (bf16 base OOMs; fp8 base ~fits).
+================================================================================
+
+--------------------------------------------------------------------------------
+WHY (the wall)
+--------------------------------------------------------------------------------
+Full 744B @ 128k, 4 nodes, grid TP8/CP2/DP2/EP16:
+    base/rank (bf16) ~= 99 GB   <-- the wall; + CP2 activation -> OOM
+    base/rank (fp8)  ~= 49 GB   <-- fits: 49 + ~100 activation + overhead < 178
+Our CP + chunked-indexer + MAX_TOK fixes solve the ACTIVATION side but not the
+base. fp8 base halves the base -> the missing piece for the full model.
+
+Public stack CANNOT keep the base fp8 today: the bridge dequantizes the FP8
+checkpoint to bf16 on load (param_mapping.py:910, cast to the module dtype), and
+--fp8-param-gather does not apply to a frozen LoRA base (tested -> still OOM).
+So this is a real port (~= the private miles-nvfp4 fork's --lora-base-precision),
+not a flag.
+
+--------------------------------------------------------------------------------
+THE 5 TASKS
+--------------------------------------------------------------------------------
+1. Build base as fp8 modules  (moderate)
+   - Wrap the bridge's model creation in fp8_model_init (megatron/core/fp8_utils.py:645)
+     so TE linears allocate Float8 weight params. Route fp8_param through
+     bridge_lora_helpers.to_megatron_provider / get_model.
+   - This is WHY --fp8-param-gather didn't work: the bridge's get_model path does
+     not wrap creation in fp8_model_init like native Megatron training.py does.
+
+2. fp8 weight-load path  (SUBSTANTIAL, make-or-break)  <-- PROTOTYPED, see below
+   - Patch megatron/bridge .../param_mapping.py mappings: when target param is
+     Float8, build a Float8BlockwiseQTensor from the checkpoint's
+     (weight_fp8, weight_scale_inv) instead of casting to bf16, threaded through
+     TP/EP sharding (each rank gets its weight slice + matching scale slice).
+
+3. LoRA freeze stays fp8  (moderate)
+   - Ensure _setup_lora_model_via_bridge freezes the base AS fp8 (no bf16 copy)
+     and the bf16 LoRA adapter forward composes with the fp8-base GEMM.
+
+4. GLM DSA/MLA fp8 compatibility  (RISK / next to prototype)
+   - GLM's custom attention (glm5.py) + tilelang indexer. The kernels see bf16
+     ACTIVATIONS (fp8 is only in weights -> GEMM outputs bf16), so most is fine.
+     BUT MLA "weight absorption" uses RAW weights in einsum
+     (e.g. q_no_pe = einsum('thd,hdm->thm', q_no_pe, w_kc) from
+     linear_kv_up_proj.weight) -- einsum won't take an fp8 tensor. Those specific
+     projections likely need a bf16 carve-out (keep small MLA up/down-proj bf16).
+
+5. Numerics validation  (required)
+   - fp8 frozen base ~2.7% weight rel err (measured, Task 2). Validate end-to-end
+     loss vs bf16 base on a real (non-pruned) checkpoint.
+
+--------------------------------------------------------------------------------
+TASK-2 PROTOTYPE RESULT  (tools/proto_fp8_expert.py, real GLM expert, on GPU)
+--------------------------------------------------------------------------------
+  [load]  fp8 weight (6144x2048, e4m3) + 128x128 blockwise scale (48x16)
+  [mem ]  12.0 MiB fp8  vs  24.0 MiB bf16                       -> 2.0x saving
+  [deq ]  (fp8, scale) -> bf16 weights, sensible range [-0.105, 0.102]
+  [gemm]  fp8-loaded weight GEMM vs bf16-ref GEMM:  rel err = 0  (load is EXACT)
+  [fp8 ]  bf16->fp8 re-quant:  weight rel err 2.65% , GEMM rel err 2.66%
+
+  => FEASIBLE & LOW-RISK. The checkpoint is standard 128x128 blockwise fp8 that
+     TE Float8BlockwiseQTensor expects; loading is exact; fp8-base precision cost
+     ~2.7% (frozen base -> no error accumulation). 2x saving -> full 744B fits.
+  Caveat: TE Float8BlockwiseQTensor is built via TE's quantizer factory
+     (Float8BlockwiseQuantizer), not direct kwargs -- plumbing detail, not a blocker.
+
+--------------------------------------------------------------------------------
+RECOMMENDATION
+--------------------------------------------------------------------------------
+- Tasks 1-4 ~= re-implementing the private miles-nvfp4 fork's base quantization.
+  If public-only is not required, ADOPT that fork (also brings DSA-CP) and layer
+  our CP/indexer/MAX_TOK fixes on top -- days, not weeks.
+- If public-only: Task 2 is de-risked (above). Task 4 (GLM MLA einsum + fp8) is
+  the remaining unknown -> prototype the MLA absorption carve-out next.
+================================================================================
