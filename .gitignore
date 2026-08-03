@@ -36,3 +36,8 @@ core
 *.core
 core.*
 .DS_Store
+
+# RL (qwen3 GRPO) — large downloads / outputs, reconstructed by the recipe
+/models-rl/
+/data-rl/
+/out-rl/

@@ -1,0 +1,100 @@
+================================================================================
+ RUN: GLM-5.2 ~270B LoRA-SFT @ 128k context on 4 nodes  (VERIFIED WORKING)
+ The largest model x longest context we have trained end-to-end on the public
+ (bf16) stack. rc=0, ~3,590 tok/s (~215k tokens/min). Job 4608, 2026-08-03.
+================================================================================
+
+--------------------------------------------------------------------------------
+WHAT THIS IS
+--------------------------------------------------------------------------------
+- Model : GLM-5.2 "30-layer" slice = ~272B params (30 layers of the full 78;
+          hidden 6144, 256 experts, MLA + DSA sparse attention). FP8 checkpoint
+          -> dequantized to bf16 on load. Frozen base + LoRA r16 (SFT).
+          NOTE: a decapitated *prefix* of the 744B model -> a real 272B network,
+          used as a memory/throughput target. (Loss is NaN with this pruned
+          checkpoint + synthetic data; this run proves TRAINABLE at scale, not
+          convergence. Correctness is a separate task -- use a real checkpoint.)
+- Context: 128k  (--seq-length 131072; real samples ~117k tokens)
+- Hardware: 4 nodes x 8 B200 = 32 GPUs.
+- Result : FITS and trains. step ok=true, no OOM, rc=0. ~3,590 tok/s steady
+          (~4.3 min/step). W&B under entity patronusai.
+
+--------------------------------------------------------------------------------
+THE WINNING CONFIG (grid + the four levers that make it fit)
+--------------------------------------------------------------------------------
+Grid:  TP8 / CP2 / PP1 / EP16 / ETP1   (world 32: DP2; EP*ETP = 16 = TP*DP)
+
+Why each lever is REQUIRED (each earlier attempt died on exactly one of these):
+  1. CP2  (context parallelism)  -> shards the 128k SEQUENCE. Activation memory
+        scales with seq-len and shards ONLY with CP. Halves it to a 64k/rank
+        profile. Needs the scoped DSA CP opt-in (see below).
+  2. EP16 (expert parallelism, via DP2) -> shards the BASE weights to ~36 GB/rank
+        (vs ~69 GB at EP8, which OOM'd the MoE backward on 2 nodes).
+  3. Chunked DSA indexer -> removes the O(S^2) dense [S x S_kv] logits matrix
+        (~206 GiB at 128k) that the "lightning indexer" otherwise materializes.
+  4. --max-tokens-per-gpu 65536 -> caps tokens PER MICRO-STEP, halving the
+        ~21.6 GiB MoE-expert micro-step activation (the last ~7.5 GB over).
+        This does NOT change the context window (seq-length stays 131072); it
+        just runs each step as 2 micro-steps.
+
+Enabling flags baked into the run (all preserve 128k):
+  --context-parallel-size 2  --expert-model-parallel-size 16
+  --recompute-granularity full   (activation recompute ON)
+  DSA_ALLOW_CP=1                 (scoped opt-in past the DSA CP assert)
+  DSA_INDEXER_Q_CHUNK=4096       (chunked indexer)
+  MAX_TOK=65536                  (-> --max-tokens-per-gpu)
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+--------------------------------------------------------------------------------
+HOW TO RUN (from scratch)
+--------------------------------------------------------------------------------
+0) Build the stack once (clones + venv + kernels + patches + overlays):
+     bash tools/build.sh
+   This applies BOTH code fixes needed here:
+     - Megatron: scoped DSA CP opt-in (transformer_config.py, gated on DSA_ALLOW_CP)
+     - Megatron-Bridge: chunked DSA indexer (overlays/megatron-bridge/glm5-tilelang-indexer.py)
+
+1) Build the 30-layer (~272B) checkpoint from the FP8 source:
+     source env.sh
+     python tools/build_Nlayer.py --n 30 \
+       --src /workspace/.cache/huggingface/hub/models--zai-org--GLM-5.2-FP8/snapshots/70311cfa0158cce7dd2cf5d2e04f68e3fdc3efc1 \
+       --dst models/GLM-5.2_30layer
+   (arch script: miles/scripts/models/glm5.2-744B-A40B_30layer.sh, N_MOE_LAYERS=27)
+
+2) Make the 128k SFT data (needle-in-haystack parquet):
+     python tools/make_128k_sft_data.py --tokenizer models/GLM-5.2_30layer \
+       --seq 131072 --n 64 --out data/sft_128k.parquet
+
+3) Submit the 4-node run:
+     sbatch scripts/cp-test-30L-128k-cp2-4node.sbatch
+   (needs all 4 nodes free; SLURM will PEND until then. It's on gpu-low.)
+
+The wrapper (scripts/cp-test-30L-128k-cp2-4node.sbatch) sets the grid + the four
+levers above and exec's the shared launcher scripts/sft-128k-glm744b.sbatch.
+
+--------------------------------------------------------------------------------
+EXPECTED SIGNALS (healthy run)
+--------------------------------------------------------------------------------
+  encoder_seq_length ......... 131072            (128k confirmed)
+  number of parameters on rank .. 18,055,666,944 (~18B/rank at EP16)
+  fn=train phase=end ok=true                     (fits, no OOM)
+  perf/actor_train_tok_per_s ~ 3,300 - 3,600     (~200-215k tokens/min)
+  perf/step_time ~ 260-330 s
+
+If it OOMs instead:
+  - "not ... 21.56 GiB ... MoE ...": lower MAX_TOK further (e.g. 32768).
+  - base too big: confirm EP16 (params/rank ~18B, not ~34B/69GB of EP8).
+
+--------------------------------------------------------------------------------
+SCALING NOTES (from the memory-scaling study; see MEMSCALE_RESULTS.md)
+--------------------------------------------------------------------------------
+- 128k memory = base weights (shard with EP/nodes) + activation (shards ONLY
+  with CP) + the indexer O(S^2) term (fixed by chunking).
+- Adding nodes alone does NOT fit a bigger model at 128k -- you must add CP
+  (for activation) AND EP (for base) together, which is what the 4-node
+  CP2/DP2/EP16 grid does.
+- Demonstrated ladder @128k (LoRA, bf16 base):
+     172B (20L): 1 node          (~54k tok/min) / 2 nodes CP2 (~180k tok/min)
+     272B (30L): 4 nodes CP2/DP2/EP16 (~215k tok/min)   <-- this run
+- Full 744B @128k does NOT fit in bf16 -> needs fp8/nvfp4 base (private fork).
+================================================================================

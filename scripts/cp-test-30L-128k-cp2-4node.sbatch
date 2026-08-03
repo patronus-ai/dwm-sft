@@ -14,9 +14,11 @@
 export MODEL_ARGS_SH=/workspace/users/zhe-li/repos/glm-sft/miles/scripts/models/glm5.2-744B-A40B_30layer.sh
 export MODEL=/workspace/users/zhe-li/repos/glm-sft/models/GLM-5.2_30layer
 export SEQ_LEN=131072
+export MAX_TOK=65536   # micro-step token cap (NOT context); halves the 21.56 GiB MoE activation. seq stays 128k.
 export PROMPT_DATA=/workspace/users/zhe-li/repos/glm-sft/data/sft_128k.parquet
 export TP=8 CP=2 PP=1 EP=16 ETP=1 NUM_EPOCH=1
 export DSA_ALLOW_CP=1
 export DSA_INDEXER_Q_CHUNK=4096
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_PROJECT=glm-cptest WANDB_GROUP=cptest RUN=cptest-30L-128k-cp2-4node
 exec bash /workspace/users/zhe-li/repos/glm-sft/scripts/sft-128k-glm744b.sbatch

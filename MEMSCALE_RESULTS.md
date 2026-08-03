@@ -91,3 +91,23 @@ Note: the 1-node 20L/128k number (895 tok/s) supersedes the earlier "~17 min/ste
 - **Demonstrated:** ~172B (20L) @128k, 2 nodes, CP2 — ~180k tokens/min.
 - **Engineered/untested:** ~270B (30L) @128k, 4 nodes, CP2/DP2/EP16.
 - **Est. 20L @128k on 4 nodes (CP2/DP2/EP16):** ~280k–340k tokens/min (DP2 doubling; sublinear).
+
+## ✅ 270B (30L) @ 128k on 4 nodes — SUCCESS (2026-08-03, job 4608)
+The largest model × longest context trained end-to-end on the public bf16 stack.
+Grid **TP8/CP2/PP1/EP16/ETP1** (world 32, DP2) + chunked indexer + `MAX_TOK=65536`.
+
+| Metric | Value |
+|--------|-------|
+| Context | 131072 (128k); real samples ~117k tokens |
+| Params/rank | 18.06 B (EP16 → base ~36 GB) |
+| Result | ✅ rc=0, all steps `ok=true`, no OOM |
+| Throughput | ~3,590 tok/s steady (~215k tokens/min), ~4.3 min/step |
+| Loss | NaN (pruned checkpoint + synthetic data — trainable, not converging) |
+
+**The four levers (each earlier attempt died on exactly one):** CP2 (shards the
+128k activation), EP16/DP2 (shards base 69→36 GB/rank), chunked DSA indexer
+(kills the O(S²) 206 GiB matrix), and `--max-tokens-per-gpu 65536` (halves the
+~21.6 GiB MoE micro-step activation). Full reproduction: `docs/run-270B-128k-4node.txt`.
+
+**128k throughput ladder (LoRA, bf16 base):** 172B/1-node ~54k tok/min →
+172B/2-node CP2 ~180k → **272B/4-node CP2/DP2/EP16 ~215k tok/min**.
