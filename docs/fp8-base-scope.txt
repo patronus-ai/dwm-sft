@@ -38,13 +38,15 @@ THE 5 TASKS
    - Ensure _setup_lora_model_via_bridge freezes the base AS fp8 (no bf16 copy)
      and the bf16 LoRA adapter forward composes with the fp8-base GEMM.
 
-4. GLM DSA/MLA fp8 compatibility  (RISK / next to prototype)
-   - GLM's custom attention (glm5.py) + tilelang indexer. The kernels see bf16
-     ACTIVATIONS (fp8 is only in weights -> GEMM outputs bf16), so most is fine.
-     BUT MLA "weight absorption" uses RAW weights in einsum
-     (e.g. q_no_pe = einsum('thd,hdm->thm', q_no_pe, w_kc) from
-     linear_kv_up_proj.weight) -- einsum won't take an fp8 tensor. Those specific
-     projections likely need a bf16 carve-out (keep small MLA up/down-proj bf16).
+4. GLM DSA/MLA fp8 compatibility  (DE-RISKED -- see result below)
+   - Only TWO raw-weight uses (can't be fp8): linear_kv_up_proj.weight (MLA
+     absorption einsum, glm5.py:567/573/308) and weights_proj.weight (indexer,
+     :650). Everything else goes through normal linear forwards -> fp8-safe
+     (fp8 weight x bf16 input -> bf16 output). The tilelang indexer + sparse-MLA
+     kernels only see bf16 ACTIVATIONS -> unaffected by fp8 weights.
+   - MEASURED carve-out: MoE experts = 97.2% of params (fp8-able); the bf16
+     carve-out (kv_up_proj + weights_proj) = 0.00% of params -> ~0 GB cost.
+     base/rank stays 99 -> ~49.5 GB even with the carve-out.
 
 5. Numerics validation  (required)
    - fp8 frozen base ~2.7% weight rel err (measured, Task 2). Validate end-to-end
