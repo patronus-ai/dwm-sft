@@ -73,6 +73,6 @@ RECOMMENDATION
 - Tasks 1-4 ~= re-implementing the private miles-nvfp4 fork's base quantization.
   If public-only is not required, ADOPT that fork (also brings DSA-CP) and layer
   our CP/indexer/MAX_TOK fixes on top -- days, not weeks.
-- If public-only: Task 2 is de-risked (above). Task 4 (GLM MLA einsum + fp8) is
-  the remaining unknown -> prototype the MLA absorption carve-out next.
+- If public-only: Tasks 2 AND 4 are de-risked (fp8 load exact @2x; carve-out 0.00%).
+  No research risk remains -> only plumbing (Tasks 1,3) + numerics (Task 5).
 ================================================================================
