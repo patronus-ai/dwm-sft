@@ -1,0 +1,42 @@
+================================================================================
+ BUG + FIX: GLM-5.2 FP8 base loaded WITHOUT its blockwise scale -> NaN loss
+ (this was the real cause of the NaN across ALL prior GLM runs, not decapitation)
+================================================================================
+
+SYMPTOM
+  Every GLM-5.2 LoRA-SFT run reported train/loss = NaN. We had assumed it was an
+  artifact of the layer-pruned ("decapitated") checkpoints + synthetic data.
+
+ROOT CAUSE
+  The GLM-5.2-FP8 checkpoint stores linear weights as blockwise fp8:
+     weight (float8_e4m3fn)  +  weight_scale_inv (F32, one per 128x128 block)
+     true weight = fp8_val * scale_inv   (per block)
+  megatron.bridge's GLM5Bridge did NOT apply the scale. It used the base
+  maybe_modify_loaded_hf_weight (no dequant); maybe_dequantize only handles TE
+  Float8Tensor, not the checkpoint's plain float8_e4m3fn -> the raw fp8 values
+  were cast straight to bf16. Measured effect on a real expert weight:
+     correct (fp8 x scale): range [-0.105, 0.102]  mean|w| 0.0143
+     bridge  (fp8 -> bf16): range [-448, 448]       mean|w| 86.3   (~6000x too large)
+  A base ~6000x too large -> forward saturates -> NaN.
+  (Other models -- minimax_m2, ministral3 -- DO override the hook with a blockwise
+   dequant; GLM5 was simply missing it. Worth upstreaming.)
+
+FIX  (overlays/megatron-bridge/glm5_bridge.py ; applied by build.sh)
+  Add to GLM5Bridge, mirroring minimax_m2:
+    - _dequant_fp8_blockwise(w, scale_inv)  (vectorized: repeat_interleave)
+    - maybe_modify_loaded_hf_weight override: when an incoming weight is fp8 and a
+      matching <key>_scale_inv exists, dequant per 128x128 block instead of casting.
+
+VALIDATION  (job 4621: 20L @ 4k, 1 node, scripts/verify-fp8-scale-20L-4k.sbatch)
+    step 1  train/loss = 8.360   grad_norm 59.9
+    step 2  train/loss = 7.132   grad_norm 15.7
+    step 3  train/loss = 5.389
+  -> FINITE and DECREASING. The model actually learns. Fix confirmed.
+
+IMPLICATIONS
+  - All earlier GLM runs (272B @128k, the memory-scaling ladder, CP runs) trained
+    on a garbage base. They remain valid as MEMORY/THROUGHPUT results, but NOT as
+    training/quality results. Re-run with this fix for anything quality-related.
+  - This is the SAME blockwise-scale logic the fp8-base port (Task 2) needs; the
+    fp8-base path keeps the fp8 tensor instead of dequantizing to bf16.
+================================================================================

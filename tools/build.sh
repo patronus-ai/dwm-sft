@@ -127,6 +127,13 @@ PYEOF
     cp "$ROOT/overlays/megatron-bridge/glm5-tilelang-indexer.py" "$_bidx"
     echo "  overlay -> bridge glm5 tilelang indexer (chunked)"
   fi
+  # OVERLAY: GLM5 fp8 base-scale load fix -- apply blockwise weight_scale_inv on load
+  # (base bridge cast fp8->bf16 WITHOUT the scale -> ~6000x too large -> NaN loss).
+  _bbr="$S/Megatron-Bridge/src/megatron/bridge/models/glm5/glm5_bridge.py"
+  if [ -f "$ROOT/overlays/megatron-bridge/glm5_bridge.py" ] && [ -f "$_bbr" ]; then
+    cp "$ROOT/overlays/megatron-bridge/glm5_bridge.py" "$_bbr"
+    echo "  overlay -> bridge glm5 fp8 base-scale load fix"
+  fi
   (cd "$S/Megatron-Bridge" && $PIP --no-deps --no-build-isolation .)
   gitclone https://github.com/fzyzcjy/torch_memory_saver.git "$S/torch_memory_saver"
   (cd "$S/torch_memory_saver" && git checkout -q d64a639 && $PIP --no-cache-dir --no-deps .)
