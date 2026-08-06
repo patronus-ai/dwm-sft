@@ -41,3 +41,7 @@ core.*
 /models-rl/
 /data-rl/
 /out-rl/
+
+# editor swap files
+*.swp
+*.swo

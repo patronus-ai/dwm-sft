@@ -1,0 +1,49 @@
+================================================================================
+ FULL GLM-5.2 744B @ 128k -- WORKING RECIPE  (job 4627, rc=0, 2026-08-04)
+ Full 78-layer 744B-A40B trained end-to-end at 131072 ctx on 4 nodes (32xB200).
+ Loss 0.92 -> 0.30 -> 0.43 -> 0.01 (descending; overfits tiny data by step 3).
+ PUBLIC stack only. NO fp8-base port needed.
+================================================================================
+
+WRAPPER:  scripts/full-744b-128k-recompute.sbatch  (execs scripts/sft-128k-glm744b.sbatch)
+
+GRID:     TP=8  CP=1  PP=1  EP=32  ETP=1   (world 32, DP=4)
+          EP*ETP = 32 = TP*DP  ;  EP32 | 256 experts  ;  PP=1 (LoRA needs it)
+          -> EP32 shards the base to ~50 GB/rank (vs ~99 at EP16): the base fits.
+
+CONTEXT:  SEQ_LEN=131072  MAX_TOK=131072   (CP1 -> one rank sees full 128k)
+
+MEMORY (the three levers that made 128k fit, in order of importance):
+  1. FULL RECOMPUTE (default; NO offload).
+     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
+     Discards activations in the forward, recomputes in backward -> low forward peak.
+     *** CPU OFFLOAD (OFFLOAD_LAYERS=78) OOM'd here *** -- it keeps full activations
+     resident while async streaming can't keep up (attempt 4626: 172.9 GiB, MoE cat OOM).
+     Recompute (attempt 4627) fit with headroom. Use recompute, not offload.
+  2. CHUNKED DSA INDEXER: DSA_INDEXER_Q_CHUNK=4096
+     Kills the O(S^2) dense [128k x 128k] fp32 score matrix (~206 GiB) -> per-query-block
+     top-k, keeps only [seq, topk]. (overlays/megatron-bridge/glm5-tilelang-indexer.py)
+  3. BASE-SCALE FIX (correctness, not memory): the bridge must dequantize the FP8
+     checkpoint's 128x128 blockwise scale on load (weight = fp8 * weight_scale_inv).
+     Without it the base loads ~6000x too large -> NaN. Memory-efficient bf16
+     block-reshape dequant (overlays/megatron-bridge/glm5_bridge.py) -- the naive
+     float32 repeat_interleave host-OOMs the full 744B load.
+
+CHECKPOINT: the FP8 141-shard checkpoint
+  /workspace/.cache/huggingface/hub/models--zai-org--GLM-5.2-FP8/snapshots/70311cfa0158cce7dd2cf5d2e04f68e3fdc3efc1
+  (dequantized to bf16 base on load via the base-scale fix above)
+
+ALSO SET: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+RUN:      sbatch scripts/full-744b-128k-recompute.sbatch
+
+LADDER THAT GOT HERE (all 4 nodes, full model):
+  4625  @4k   EP32 bf16               -> WORKS (loss 1.49->0.23)  [full model proof]
+  4626  @128k EP32 + OFFLOAD 78       -> OOM in MoE grouped-GEMM (offload kept activations)
+  4627  @128k EP32 + full RECOMPUTE   -> WORKS, rc=0  <== THE WORKING CONFIG
+
+THROUGHPUT: heavy (128k + full recompute + 744B). ~1 optimizer step / few min.
+  Future speedup lever (NOT required): fp8 base (GLM_FP8_BASE=1, Task-1 patch already
+  in overlays/megatron-bridge/gpt_provider.py, OFF by default) -> base ~49 GB -> frees
+  room for CP2 (halve per-rank tokens) -> higher throughput. Needs Task 2/4 finish.
+================================================================================

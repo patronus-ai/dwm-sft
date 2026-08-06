@@ -1,0 +1,168 @@
+================================================================================
+ HOW THE FULL GLM-5.2 744B RUNS AT 128k CONTEXT ON 4 NODES
+ Techniques & remedies, explained  (validated: jobs 4627/4629, rc=0, 2026-08-04)
+================================================================================
+Full 78-layer GLM-5.2 744B-A40B, LoRA-SFT, seq_len 131072, 4 nodes x 8 B200
+(32 GPUs, ~183 GB each). PUBLIC stack only. Finite descending loss.
+
+Run it:  sbatch scripts/full-744b-128k-recompute.sbatch   (20 steps: -20steps.sbatch)
+
+
+================================================================================
+ PART 1 -- WHY 128k x 744B IS HARD (the memory model)
+================================================================================
+Per-GPU memory (183 GB budget) at 128k has FOUR competing consumers. Each needs a
+different remedy, and fixing one does NOT fix the others:
+
+  (A) BASE WEIGHTS       744B in bf16 = ~1.5 TB. Shards ONLY with expert-parallel
+                         (EP) for the experts (97% of params) + tensor-parallel (TP)
+                         for the rest. More EP -> smaller base/rank. Independent of
+                         sequence length.
+  (B) ACTIVATIONS        Grow with SEQUENCE LENGTH x NUMBER OF LAYERS. At 128k over
+                         78 layers this is enormous and is the thing that "128k"
+                         actually costs. Shards with context-parallel (CP) OR is
+                         traded away with recompute/offload.
+  (C) DSA INDEXER        DeepSeek Sparse Attention builds a dense [S x S] score
+                         matrix to pick top-k keys. At S=128k that fp32 matrix is
+                         ~206 GiB -- an O(S^2) wall that alone blows the budget.
+  (D) LOGITS / LM HEAD   Output [S x vocab] = 128k x 154880. If materialized in
+                         fp32 that is huge; a lever exists to shrink it.
+
+The grid constraint that makes it a puzzle:  TP x CP x DP = 32 (world size), and
+EP x ETP = TP x DP. So you CANNOT max out both base-sharding (big EP) and
+activation-sharding (big CP) at once -- they compete for the same 32 GPUs.
+  * EP32/CP1 -> base ~50 GB/rank (great) BUT each rank sees the full 128k activation.
+  * EP16/CP2 -> activation halved BUT base ~99 GB/rank (too big for 78 layers).
+Neither fits in bf16 by itself. The solution is to pick EP32/CP1 (win on base) and
+then defeat the activation cost another way (recompute) instead of with CP.
+
+
+================================================================================
+ PART 2 -- THE REMEDIES (each maps to one consumer above)
+================================================================================
+
+--------------------------------------------------------------------------------
+REMEDY 1 -- EP32 grid: shard the BASE as hard as possible        (fixes A)
+--------------------------------------------------------------------------------
+  Grid: TP=8  CP=1  PP=1  EP=32  ETP=1   (world 32, DP=4)
+  Check: EP*ETP = 32 = TP*DP ; EP=32 divides 256 experts ; PP=1 (LoRA requires it).
+
+  Why: the 256 experts hold ~97% of the 744B params. EP32 splits them across all 32
+  GPUs -> base drops from ~99 GB/rank (EP16) to ~50 GB/rank. That ~49 GB we free is
+  exactly the headroom the 128k activations need. This is the single most important
+  grid choice; it is what lets a bf16 base fit at all without an fp8 port.
+
+  Cost: EP32 forces CP=1 (no GPUs left for context-parallel), so each rank must
+  process the entire 128k sequence -> Remedy 2 becomes mandatory.
+
+--------------------------------------------------------------------------------
+REMEDY 2 -- FULL RECOMPUTE, *not* CPU offload: defeat activations (fixes B)
+--------------------------------------------------------------------------------
+  Flags: --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
+  (this is the DEFAULT branch of the launcher; do NOT set OFFLOAD_LAYERS.)
+
+  Why recompute: with CP=1 each rank holds 78 layers of 128k activations. Full
+  recompute DISCARDS layer activations during the forward pass and RECOMPUTES them
+  on demand in the backward pass -> the forward-pass peak is tiny (only the current
+  layer is live). You trade compute (~1 extra forward) for memory. This is what
+  brings the 128k activation footprint under the budget.
+
+  *** KEY EMPIRICAL FINDING: recompute BEATS CPU offload here. ***
+  We tried CPU activation offload first (OFFLOAD_LAYERS=78, job 4626). It OOM'd in
+  the MoE grouped-GEMM: 172.9 GiB in use, 1.4 GiB short. Offload KEEPS the full
+  activations resident on the GPU and streams them to host RAM asynchronously -- but
+  at 128k the stream can't drain fast enough, so activations pile up and the peak
+  stays high. Recompute (job 4627) never holds them at all -> it fit with headroom.
+  Lesson: for very long context, recompute's low peak > offload's bandwidth-limited
+  drain. Offload is the wrong tool at 128k.
+
+--------------------------------------------------------------------------------
+REMEDY 3 -- CHUNKED DSA INDEXER: kill the O(S^2) wall           (fixes C)
+--------------------------------------------------------------------------------
+  Env: DSA_INDEXER_Q_CHUNK=4096
+  Code: overlays/megatron-bridge/glm5-tilelang-indexer.py (patched into the bridge
+        by tools/build.sh; rewrites lighting_indexer / IndexerScoreFunction).
+
+  Why: DSA picks the top-2048 keys per query by scoring every query against every
+  key -> a dense [128k x 128k] fp32 matrix = ~206 GiB. That one tensor exceeds a
+  whole GPU. The fix processes queries in blocks of DSA_INDEXER_Q_CHUNK (4096): for
+  each block it runs the indexer kernel, takes top-k, and keeps only [block, topk] --
+  never materializing the full square. Peak indexer memory drops from O(S^2) to
+  O(chunk x S), i.e. from ~206 GiB to a few GiB. Without this, nothing at 128k runs,
+  regardless of grid.
+
+  (Related: transformer_config.py has a hard assert blocking DSA under CP>1; we
+  scoped it behind DSA_ALLOW_CP=1 for the CP2 experiments. Not needed at CP=1, but
+  it's why the 30-layer CP2 runs were possible.)
+
+--------------------------------------------------------------------------------
+REMEDY 4 -- BASE-SCALE FIX: load the FP8 checkpoint CORRECTLY  (correctness, not memory)
+--------------------------------------------------------------------------------
+  Code: overlays/megatron-bridge/glm5_bridge.py  (GLM5Bridge.maybe_modify_loaded_hf_weight
+        + _dequant_fp8_blockwise).
+
+  Why: the checkpoint is GLM-5.2-FP8 -- 128x128 BLOCKWISE fp8. The true weight is
+  fp8_value x weight_scale_inv (one fp32 scale per 128x128 block). The stock bridge
+  cast fp8 -> bf16 WITHOUT applying that per-block scale, so the base loaded ~6000x
+  too large -> NaN loss. This was the real cause of the "NaN"/"garbage base" we
+  chased earlier (it was NOT a pruned-model artifact). The fix dequantizes properly:
+  weight = fp8 x scale_inv, per block, on load.
+
+  Sub-remedy 4b -- MEMORY-EFFICIENT dequant: the first fix used
+  scale.repeat_interleave(...) which materializes a full [N,K] fp32 scale per weight.
+  Fine for 20 layers, but at the full 744B (~14k expert weights) it spiked HOST RAM
+  and the kernel OOM-killed the loader worker (job 4623 died). Rewrote it as a bf16
+  block-reshape broadcast (view into [N/128,128,K/128,128], multiply by the small
+  [.,1,.,1] scale) -- no [N,K] fp32 temp -> the full base loads without host-OOM.
+
+--------------------------------------------------------------------------------
+REMEDY 5 -- allocator + (available) logits lever                (fixes D, fragmentation)
+--------------------------------------------------------------------------------
+  Env: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+       -> reduces allocator fragmentation so large contiguous allocs (e.g. the MoE
+          grouped-GEMM cat) succeed near the memory ceiling.
+  Available if needed: CE_FP16=1 -> --fp16-lm-cross-entropy computes the LM
+       cross-entropy in bf16 instead of fp32, halving the [128k x vocab] logits
+       memory. We did NOT need it at EP32 (recompute freed enough room that the
+       logits fit), but it's the first knob to pull if the output layer OOMs.
+
+
+================================================================================
+ PART 3 -- THE LADDER (how we proved it, all 4 nodes, full 78-layer model)
+================================================================================
+  job 4625  @4k    EP32 bf16, recompute        -> WORKS  (loss 1.49->0.23)
+                     ^ proves the full model + base-scale fix are correct.
+  job 4626  @128k  EP32 + CPU OFFLOAD 78 layers -> OOM in MoE grouped-GEMM
+                     ^ offload keeps activations resident; stream can't drain.
+  job 4627  @128k  EP32 + FULL RECOMPUTE        -> WORKS, rc=0   <== THE ANSWER
+                     ^ loss 0.92->0.30->0.43->0.01, no OOM.
+  job 4629  @128k  same, NUM_EPOCH=5            -> 20-step run.
+
+WHAT WAS *NOT* NEEDED: an fp8 frozen base. Earlier analysis assumed the full model
+needed an fp8-base port (bf16 base @ 128k "can't fit"). That was true only for the
+EP16/CP2 grid; EP32/CP1 + recompute fits in bf16. The fp8 path (GLM_FP8_BASE=1,
+Task-1 wrap in overlays/megatron-bridge/gpt_provider.py) is built but OFF by default
+-- it remains a FUTURE THROUGHPUT lever (fp8 base ~49 GB frees room for CP2 -> shard
+the sequence -> higher tokens/s), not a requirement to run.
+
+This also overturned the 2026-07-24 "20-layer ceiling" conclusion: back then the
+chunked indexer did not exist and the runs were 1-2 nodes at EP8/EP16. With Remedies
+1-4 together, the full 78-layer model runs at 128k.
+
+
+================================================================================
+ PART 4 -- THROUGHPUT & the mental model
+================================================================================
+  Measured (job 4627/4629): ~1,130-1,160 tokens/sec  =  ~68,000-70,000 tokens/min.
+  Step time ~807-828 s (~13.5 min/step). ~39-40 TFLOPS/GPU (well under B200 peak).
+
+  Why modest: full recompute ~doubles forward FLOPs, and CP=1 means no sequence
+  parallelism -- we bought "it fits" with compute. The upgrade path is fp8 base ->
+  free enough memory to enable CP2 (or drop recompute) -> the ~200k tok/min range the
+  30-layer CP2 runs reached.
+
+  ONE-LINE MENTAL MODEL:
+    EP32 shrinks the BASE so it fits; RECOMPUTE erases the ACTIVATIONS so 128k fits;
+    the CHUNKED INDEXER removes the O(S^2) attention wall; the BASE-SCALE FIX makes
+    the loaded weights correct. All four are necessary; drop any one and it OOMs or NaNs.
+================================================================================

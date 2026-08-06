@@ -1,0 +1,95 @@
+================================================================================
+ WHY THE FULL GLM-5.2 744B FITS AT 128k -- MEMORY ACCOUNTING
+ Per-GPU budget ~= 178 GB usable (of 183 GB on a B200).  4 nodes x 8 = 32 GPUs.
+ Model: full 78-layer 744B-A40B, LoRA-SFT, seq_len 131072.
+ Last updated: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+THE CORE IDEA: attack four consumers on SEPARATE axes
+--------------------------------------------------------------------------------
+At 128k, four things compete for the 178 GB. The trick is that each is defeated by
+a DIFFERENT, INDEPENDENT mechanism -- so they don't stack up:
+
+  Consumer            Scales with          Defeated by
+  -----------------   ------------------   ---------------------------------------
+  Base weights        params (seq-indep)   Expert-parallel (EP) -- shard 256 experts
+  Activations         seq_len x layers     Context-parallel (CP) + recompute
+  DSA indexer         seq_len^2            Chunked indexer
+  Logits              seq_len x vocab      Sharded by TP / sequence-parallel
+
+--------------------------------------------------------------------------------
+PER-GPU BUDGET -- the two working configs
+--------------------------------------------------------------------------------
+EP32/CP1  (job 4627 -- FITS, but MARGINAL):
+    Base weights (bf16)           ~50 GB    <- experts sharded 32 ways
+    Recompute checkpoints        ~117 GB    <- 78 layers x 128k tokens  <== DOMINANT
+    DSA indexer (chunked)         ~few GB
+    Working (MoE/LoRA/logits)      remainder
+    ---------------------------------------
+    Floor ~167 GB, peaks ~175  -> fits with <6 GB headroom
+
+CP2/EP16  (job 4631 -- ROBUST):
+    Base weights (bf16)          ~96-99 GB  <- experts sharded only 16 ways (bigger)
+    Recompute checkpoints         ~58 GB    <- CP2 HALVES tokens/rank -> halves this
+    Working                        smaller  <- also halved per-rank tokens
+    ---------------------------------------
+    Peak ~161 GB  -> ~17 GB headroom
+
+(Figures approximate; the ~50/~117 split at CP1 is grounded in the OOM logs:
+ ~162 GB allocated minus ~50 GB base ~= ~112 GB non-base.)
+
+--------------------------------------------------------------------------------
+WHY IT FITS -- the four mechanisms
+--------------------------------------------------------------------------------
+1. EP SHRINKS THE BASE.
+   The 744B is 97% experts. Splitting 256 experts across 16-32 GPUs takes the base
+   from ~1.5 TB down to ~50-99 GB/rank. The base scales with PARAMETERS, not
+   sequence -- so EP is the right axis and it is independent of context length.
+
+2. RECOMPUTE ERASES THE ACTIVATIONS.
+   Without recompute, holding all 78 layers' full 128k activations is hundreds of
+   GB. Full recompute stores only each layer's INPUT (a "checkpoint") and rebuilds
+   the internals during the backward pass -- so at any instant only ONE layer's
+   activation is live. This converts "store everything" into "store 78 thin
+   checkpoints."
+
+3. CP HALVES WHAT RECOMPUTE STILL STORES.
+   Those 78 checkpoints are still the DOMINANT term (~117 GB at CP1). Context-
+   parallel shards the SEQUENCE across 2 GPUs -> each rank holds 65,536 tokens
+   instead of 131,072 -> checkpoints drop to ~58 GB. This is why CP2/EP16 has a
+   LOWER peak than EP32/CP1 despite the bigger base: the checkpoint term dominates,
+   and halving it beats the base doubling.
+
+4. THE CHUNKED INDEXER REMOVES AN O(S^2) LANDMINE.
+   DSA's raw score matrix is [128k x 128k] fp32 ~= 206 GB -- bigger than a whole
+   GPU. Chunking queries into 4k blocks and keeping only top-k drops this to a few
+   GB. Without it, nothing else matters. (DSA sparse attention itself -- top-2048
+   keys -- also keeps the attention compute bounded, which is why 128k is tractable
+   at all.)
+
+--------------------------------------------------------------------------------
+THE TENSION (why it's a balance, not a free lunch)
+--------------------------------------------------------------------------------
+With only 32 GPUs, the grid constraints  EP x ETP = TP x DP  and  TP x CP x DP = 32
+mean you CANNOT max EP and CP simultaneously -- they draw from the same 32 GPUs.
+So it is a balance:
+  * EP32/CP1 -> all-in on base sharding, but each rank eats the full 128k activation.
+  * CP2/EP16 -> split the budget: less base sharding, but the DOMINANT activation
+                term halves.
+Because activations (checkpoints) are the bigger consumer at 128k, CP2/EP16 is the
+better balance -- that's the whole reason 4631 has ~17 GB headroom while 4627 had <6.
+
+--------------------------------------------------------------------------------
+ONE-LINE VERSION
+--------------------------------------------------------------------------------
+It fits because EP shrinks the seq-independent BASE, recompute + CP shrink the
+seq-dependent ACTIVATIONS, and the chunked indexer removes the O(S^2) ATTENTION
+wall -- three orthogonal cuts that keep all four consumers under 178 GB at once.
+The bf16 base at EP16 (~96 GB) is what makes it TIGHT; that's exactly what an fp8
+base (~48 GB) would relieve.
+
+See also: docs/how-128k-744b-works-EXPLAINED.txt (techniques/remedies),
+          docs/full-744b-128k-WORKING.txt (working recipe),
+          docs/full-128k-experiments-log.txt (experiment history).
+================================================================================

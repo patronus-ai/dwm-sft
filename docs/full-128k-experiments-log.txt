@@ -1,0 +1,92 @@
+================================================================================
+ FULL GLM-5.2 744B @ 128k -- EXPERIMENT LOG
+ Model: full 78-layer 744B-A40B (all 256 experts), LoRA-SFT, seq_len 131072.
+ Cluster: 4 nodes x 8 B200 (32 GPUs, ~183 GB each). PUBLIC stack.
+ Last updated: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+EXPERIMENTS & STATUS
+--------------------------------------------------------------------------------
+Job    Config                                Status            What happened
+----   -----------------------------------   ---------------   -----------------------------------------
+4625   @4k   EP32/CP1, recompute             SUCCESS           Full-model proof: loss 1.49->0.23, no OOM.
+                                                                (4k not 128k -- validated the full model +
+                                                                base-scale fix before pushing context.)
+4626   @128k EP32/CP1 + CPU OFFLOAD 78L      OOM               Base loaded fine; died in MoE grouped-GEMM
+                                                                (172.9 GiB in use, 1.4 GiB short). Offload
+                                                                kept activations resident; stream lagged.
+4627   @128k EP32/CP1 + FULL RECOMPUTE       SUCCESS (rc=0)    *** BREAKTHROUGH *** 4 steps (1 epoch),
+                                                                loss 0.92->0.30->0.43->0.01, no OOM.
+                                                                Full 744B @ 128k trains end-to-end.
+4628   @128k EP32/CP1 recompute, 1 epoch     CANCELLED         Redirected to a 20-step run.
+4629   @128k EP32/CP1, 20 steps              OOM @ step ~12    Ran 11 steps, then OOM in the LoRA expert
+                                                                forward (peft/utils.py:1433): tried 7.86 GiB,
+                                                                6.72 free, 3.17 GiB stranded (fragmentation).
+4630   @128k EP32/CP1 + GC-threshold, 20 st  OOM @ step 8      garbage_collection_threshold:0.8 not enough;
+                                                                OOM'd EARLIER (7.91 GiB) -> proves the OOM
+                                                                is STOCHASTIC, not a fixed step.
+4631   @128k CP2/EP16, 20 steps              RUNNING           Halves recompute checkpoints -> ~17 GB
+                                                                headroom (vs ~3). Current attempt.
+
+--------------------------------------------------------------------------------
+WHAT WENT WRONG (root causes)
+--------------------------------------------------------------------------------
+1. OFFLOAD OOM (4626)
+   CPU activation offload keeps the full activations on-GPU and streams them to
+   host RAM asynchronously. At 128k the stream can't drain fast enough, so
+   activations pile up and the peak stays high -> OOM in the MoE grouped-GEMM.
+   Lesson: offload is the wrong tool at very long context.
+
+2. FRAGMENTATION OOMs (4629, 4630)
+   EP32/CP1 sits at a ~167 GB floor per rank: base ~50 GB + ~117 GB of recompute
+   checkpoints (78 layer inputs at 128k). That leaves <6 GB headroom. When the
+   LONGEST 128k sample lands on an already-fragmented rank, the ~8 GB LoRA-expert
+   allocation fails. It is STOCHASTIC: 4629 died at step 12, 4630 at step 8,
+   because sample-to-rank assignment reshuffles every epoch. Pure allocator tuning
+   (garbage_collection_threshold) did NOT create real headroom -> need to lower the
+   actual peak, not defragment.
+
+--------------------------------------------------------------------------------
+WHAT WE LEARNED
+--------------------------------------------------------------------------------
+* Full 744B @ 128k IS runnable on 4 nodes -- public stack, finite loss (4627, rc=0).
+  The core goal is proven.
+* RECOMPUTE > OFFLOAD for long context -- the single most important fit lever.
+* EP32/CP1 FITS BUT IS MARGINAL: great for a short proof, too thin (<6 GB headroom)
+  for a sustained multi-step run.
+* The RECOMPUTE CHECKPOINTS (~117 GB) DOMINATE memory, not the base. This flips the
+  grid choice: CP2 halves the dominant term, so CP2/EP16 (base 99 but checkpoints
+  ~58) has a LOWER peak (~161 GB) than EP32/CP1 (~175 GB) despite the bigger base.
+  -> CP2/EP16 (4631) is the robust grid, and it's what the 30-layer runs used.
+* The robust long-term headroom + throughput lever is FP8-BASE (base 50->25 GB),
+  which would also let us DROP recompute. It is built but OFF by default
+  (GLM_FP8_BASE=1; Task-1 wrap in overlays/megatron-bridge/gpt_provider.py); the
+  load/carve-out plumbing (Task 2/4) is unfinished.
+
+--------------------------------------------------------------------------------
+THE FOUR TECHNIQUES THAT MAKE 128k WORK AT ALL  (see how-128k-744b-works-EXPLAINED.txt)
+--------------------------------------------------------------------------------
+1. EP32 (or EP16+CP2) to shard the 744B base.
+2. Full activation recompute (NOT offload) to absorb 128k activations.
+3. Chunked DSA indexer (DSA_INDEXER_Q_CHUNK=4096) to kill the O(S^2) ~206 GB
+   attention-score matrix.
+4. Base-scale fix: dequantize the FP8 checkpoint's 128x128 blockwise scale on load
+   (else base loads ~6000x too large -> NaN).
+
+--------------------------------------------------------------------------------
+THROUGHPUT (measured)
+--------------------------------------------------------------------------------
+* EP32/CP1 (4627): ~1,130-1,160 tok/s = ~68-70k tok/min, ~13.5 min/step, ~40 TFLOPS/GPU.
+  Modest because full recompute ~doubles forward FLOPs and CP1 has no seq-parallel.
+* CP2/EP16 expected higher (30-layer CP2 runs reached ~215k tok/min) -- to be
+  confirmed on 4631.
+
+--------------------------------------------------------------------------------
+REPRODUCE
+--------------------------------------------------------------------------------
+  4-step proof:  sbatch scripts/full-744b-128k-recompute.sbatch    (EP32/CP1)
+  20-step run:   sbatch scripts/full-744b-128k-cp2-20steps.sbatch   (CP2/EP16, robust)
+  Recipe + memory model: docs/full-744b-128k-WORKING.txt,
+                         docs/how-128k-744b-works-EXPLAINED.txt
+================================================================================

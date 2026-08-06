@@ -98,7 +98,11 @@ fi
 OPT_ARGS=(--optimizer adam --lr ${LR:-1e-4} --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.95)
 MISC_ARGS=(--attention-dropout 0.0 --hidden-dropout 0.0 --accumulate-allreduce-grads-in-fp32
   --attention-softmax-in-fp32 --attention-backend flash --allgather-cp
-  --dsa-attention-backend tilelang --qkv-format thd)     # long-ctx: recompute-safe + packed
+  --qkv-format thd)                                      # long-ctx: recompute-safe + packed
+# GENERIC launcher (copy of sft-128k-glm744b.sbatch): DSA backend is GLM-5.2/DeepSeek-DSA
+# specific. Default tilelang (so this copy still runs GLM); set DSA_BACKEND=none for
+# standard-attention models (Qwen3-MoE, GLM-4, DeepSeek-V2).
+[ "${DSA_BACKEND:-tilelang}" != "none" ] && MISC_ARGS+=(--dsa-attention-backend "${DSA_BACKEND:-tilelang}")
 # CE_FP16=1 -> compute the LM cross-entropy in bf16 instead of fp32. At 128k the
 # per-rank vocab-parallel logits are ~10 GB in fp32; bf16 halves that (~5 GB saved).
 [ "${CE_FP16:-0}" = "1" ] && MISC_ARGS+=(--fp16-lm-cross-entropy)
@@ -109,7 +113,7 @@ WANDB_ARGS=(--use-wandb --wandb-project "${WANDB_PROJECT:-glm744b-128k-zheli}"
 }
 build_args
 
-TENV='["INDEXER_ROPE_NEOX_STYLE","NVSHMEM_DISABLE_NCCL","GLOO_SOCKET_IFNAME","NCCL_SOCKET_IFNAME","NCCL_IB_DISABLE","NCCL_IB_HCA","NCCL_NVLS_ENABLE","NCCL_CROSS_NIC","NCCL_NET_GDR_LEVEL","NCCL_DEBUG","PYTORCH_CUDA_ALLOC_CONF","DSA_ALLOW_CP","DSA_INDEXER_Q_CHUNK"]'
+TENV='["INDEXER_ROPE_NEOX_STYLE","NVSHMEM_DISABLE_NCCL","GLOO_SOCKET_IFNAME","NCCL_SOCKET_IFNAME","NCCL_IB_DISABLE","NCCL_IB_HCA","NCCL_NVLS_ENABLE","NCCL_CROSS_NIC","NCCL_NET_GDR_LEVEL","NCCL_DEBUG","PYTORCH_CUDA_ALLOC_CONF","DSA_ALLOW_CP","DSA_INDEXER_Q_CHUNK","NVTE_FUSED_ATTN","NVTE_FLASH_ATTN"]'
 TRAIN_ENV_JSON=$(TENV="$TENV" python3 -c 'import os,json;print(json.dumps({k:os.environ[k] for k in json.loads(os.environ["TENV"]) if k in os.environ}))')
 
 TRAIN_CMD=(python3 -u train_async.py --actor-num-nodes $NNODES --actor-num-gpus-per-node $GPN

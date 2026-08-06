@@ -35,13 +35,22 @@ _FP8_BLOCK = 128
 
 def _dequant_fp8_blockwise(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
     """GLM-5.2 FP8: true bf16 weight = fp8_val * scale_inv, per 128x128 block.
-    Vectorized (repeat_interleave) -- fast vs a per-block python loop.
     zhe-li: the base bridge cast fp8->bf16 WITHOUT this scale, loading the base
-    ~6000x too large -> garbage base -> NaN loss. This restores the true weights."""
+    ~6000x too large -> garbage base -> NaN loss. This restores the true weights.
+    MEMORY-EFFICIENT: block-reshape broadcast in bf16 -- avoids materializing a full
+    [N,K] float32 scale (repeat_interleave), which host-OOM'd the full 744B load."""
+    B = _FP8_BLOCK
     N, K = weight.shape
-    s = scale_inv.to(torch.float32)
-    s = s.repeat_interleave(_FP8_BLOCK, 0)[:N].repeat_interleave(_FP8_BLOCK, 1)[:, :K]
-    return (weight.to(torch.float32) * s).to(torch.bfloat16)
+    w = weight.to(torch.bfloat16)
+    s = scale_inv.to(torch.bfloat16)
+    if N % B == 0 and K % B == 0:
+        # broadcast the small [sN,1,sK,1] scale over blocks -- no [N,K] scale temp
+        wv = w.view(N // B, B, K // B, B)
+        sv = s.view(N // B, 1, K // B, 1)
+        return (wv * sv).reshape(N, K)
+    # rare non-divisible dims: bf16 repeat (still avoids float32)
+    s = s.repeat_interleave(B, 0)[:N].repeat_interleave(B, 1)[:, :K]
+    return w * s
 
 
 logger = logging.getLogger(__name__)

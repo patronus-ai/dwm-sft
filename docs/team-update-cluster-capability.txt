@@ -1,0 +1,97 @@
+Subject: 4-node B200 cluster capability test — GLM-5.2 744B — findings & input for new-cluster spec
+
+Hi [name],
+
+Over the last few weeks I stress-tested what our current 4-node B200 cluster
+(32× B200, 183 GB each) can actually train, using GLM-5.2 (744B-A40B MoE, 78
+layers, MLA + DSA sparse attention) as the target. Goal: find the ceiling on the
+current hardware and use it to inform the spec for the new cluster. Summary below.
+
+────────────────────────────────────────────────────────────────────────────
+BOTTOM LINE
+────────────────────────────────────────────────────────────────────────────
+• We CAN run LoRA-SFT of the FULL 744B model at 128k context on the current 4
+  nodes — end to end, public software stack, finite/decreasing loss. This is the
+  headline result and it exceeds what we thought was possible a few weeks ago.
+• We CANNOT do full-parameter (non-LoRA) SFT of 744B on 4 nodes — that needs
+  ~12 TB of optimizer/gradient state (roughly 8× more GPU memory than we have).
+• Throughput at 128k is modest (~68–70k tokens/min) because we have to trade
+  compute for memory to fit. With more hardware that trade goes away.
+
+────────────────────────────────────────────────────────────────────────────
+WHAT WE TESTED (experiment ladder)
+────────────────────────────────────────────────────────────────────────────
+We scaled model size and context to map the breaking points:
+
+  Model / config              Ctx    Nodes  Result        Throughput
+  ─────────────────────────   ────   ─────  ───────────   ───────────────
+  172B slice (20 layers)      128k   1      fits (edge)   ~54k tok/min
+  172B slice (20 layers)      128k   2      fits (CP2)    ~180k tok/min
+  272B slice (30 layers)      128k   4      fits (CP2)    ~215k tok/min
+  FULL 744B (78 layers)       4k     4      fits          (proof of full model)
+  FULL 744B (78 layers)       128k   4      FITS ✔        ~68–70k tok/min
+  FULL 744B, full-parameter   any    4      NOT feasible  (needs ~12 TB)
+
+Getting the full model to 128k on 4 nodes required four techniques stacked
+together (any one missing → out-of-memory or NaN):
+  1. Max expert-parallel (EP32) to shard the 744B base to ~50 GB/GPU.
+  2. Full activation recompute (NOT CPU offload — offload OOM'd) to absorb the
+     128k activations.
+  3. A custom "chunked" sparse-attention indexer to kill an O(S²) 206 GB score
+     matrix that otherwise blows a whole GPU at 128k.
+  4. A correctness fix for loading the FP8 checkpoint (blockwise dequant) —
+     without it the base loaded ~6000× too large and produced NaNs.
+
+────────────────────────────────────────────────────────────────────────────
+THE WALLS WE HIT (what limits the current cluster)
+────────────────────────────────────────────────────────────────────────────
+• MEMORY is the binding constraint, from four competing consumers: base weights,
+  activations (∝ context × layers), the O(S²) attention indexer, and the logits.
+• The core trade-off: with only 32 GPUs we can shard the BASE hard (EP32) OR the
+  SEQUENCE (context-parallel), but not both — they compete for the same GPUs. So
+  for the full model at 128k we had to keep the whole sequence on each GPU and pay
+  for it with full recompute → ~2× the compute → lower throughput (~40 TFLOPS/GPU,
+  well under B200 peak).
+• At the very edge (full 744B @ 128k) the fit is thin: long runs occasionally hit
+  fragmentation OOMs that we're mitigating with allocator tuning. It works, but
+  there's little headroom.
+
+────────────────────────────────────────────────────────────────────────────
+IMPLICATIONS FOR THE NEW CLUSTER SPEC
+────────────────────────────────────────────────────────────────────────────
+Framing: 4 nodes is the MINIMUM to do 744B LoRA-SFT at 128k, and it's compute-
+bound because we're memory-starved. To make this comfortable and fast (and to
+open up full-parameter training / larger models), the levers are:
+
+1. MORE GPUs (scale-out) — the single highest-value change.
+   • 8 nodes (64 GPUs) would let us run EP + context-parallel TOGETHER, drop the
+     full recompute, and push throughput from ~68k toward the ~200k+ tok/min we
+     already measured on the 272B/CP2 runs — a ~3× speedup at 128k.
+   • It also gives real memory headroom (no fragmentation-edge runs).
+
+2. MORE VRAM per GPU — reduces how aggressively we must shard/recompute; directly
+   raises the largest context and batch we can fit per node.
+
+3. FULL-PARAMETER 744B would need on the order of 8× our current GPU memory
+   (~12 TB) — i.e. a much larger cluster (~30+ nodes at current VRAM), OR staying
+   on parameter-efficient (LoRA/QLoRA) training. Worth an explicit decision:
+   do we need full-parameter training of 700B-class models, or is LoRA sufficient?
+
+4. INTERCONNECT matters — EP and context-parallel are communication-heavy;
+   fast inter-node fabric (current RoCE/IB is adequate at 4 nodes) becomes more
+   important as we scale out.
+
+Suggested decision points for the new-cluster spec:
+  • Target the largest model + context we actually need in production, then size
+    for it WITHOUT recompute (i.e. buy enough GPUs to shard both base and
+    sequence). For 744B @ 128k that's ~8 nodes as a comfortable floor.
+  • Decide LoRA-only vs full-parameter for 700B-class models — this is a ~4–8×
+    swing in cluster size.
+
+Happy to walk through the detailed memory model, the per-config numbers, or a
+sizing estimate for a specific target model/context. Full technical write-ups and
+reproducible run scripts are in the repo (docs/how-128k-744b-works-EXPLAINED.txt,
+docs/full-744b-128k-WORKING.txt).
+
+Thanks,
+Zhe
